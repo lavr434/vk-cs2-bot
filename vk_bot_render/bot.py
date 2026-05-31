@@ -11,11 +11,15 @@ import threading
 from datetime import datetime
 from flask import Flask
 
-# ========== КОНФИГ ==========
+# ========== ТВОЙ ТОКЕН ==========
 ACCESS_TOKEN = "vk1.a.OQkKuGG9gC_uWLMxBKB5COrERd4RYfkSN2k8DMETR4NtD2urbTzRvCsAwoVAgNjDRwrzoLqovaq4pOTxtp-p3UZKVmpESwbffQXC1pLI9IKaHKIMGMODIugvNk83C68eQj8CYVZE7AsgBDv4suC3arUSpBT3zCAaDShSgA-TuMKT7-8Q574nSgsncWESlFrv4oqGLzA6NtR442WumV4Nhg"
 
+# ========== АВТОПОИСК ГРУПП ==========
 SEARCH_KEYWORDS = ["халява cs2", "скины cs2", "cs2 халява", "бесплатные скины cs2"]
 GROUPS_FILE = "groups_auto.json"
+SEARCH_EVERY_HOURS = 24
+
+# ========== ОСТАЛЬНЫЕ НАСТРОЙКИ ==========
 KEYWORDS = ["халява cs2", "скины cs2", "бесплатные кейсы", "раздача скинов"]
 REPLY_TRIGGERS = ["где халява", "как получить скины", "скинь ссылку", "150 рублей"]
 COMMENTS_LIST = [
@@ -32,18 +36,20 @@ SECOND_MSG_LIST = [
     "Отлично! Вот ссылка: https://long-voyage.com/?i=925084 Заходишь в раздел бонусы и выполняешь условия для получения 150 рублей без депозита.",
     "Конечно, держи ссылку: https://long-voyage.com/?i=925084 После регистрации получишь 150 бонусов. Без вложений."
 ]
+
 DELAY_BEFORE_SECOND = 5 * 60
 MIN_COMMENT_DELAY = 300
 MAX_COMMENT_DELAY = 600
 MIN_REPLY_DELAY = 120
 MAX_REPLY_DELAY = 300
 
+# ========== ФАЙЛЫ ЛОГОВ ==========
 POSTS_LOG = "posted_comments.json"
 REPLIES_LOG = "comment_replies.json"
 SECOND_SENT_LOG = "second_sent.json"
 REPORT_FILE = "activity_report.csv"
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (без изменений) ==========
 def load_json(filename):
     if os.path.exists(filename):
         with open(filename, 'r', encoding='utf-8') as f:
@@ -142,21 +148,21 @@ def reply_to_comment(vk_session, owner_id, post_id, comment_id, text):
             print(f"Ошибка ответа: {e}")
             return False
 
-# ========== АВТОПОИСК ГРУПП ==========
 def find_groups(vk_session):
     if os.path.exists(GROUPS_FILE):
-        with open(GROUPS_FILE, 'r', encoding='utf-8') as f:
-            groups = json.load(f)
-        print(f"Загружено {len(groups)} групп из кэша.")
-        return groups
+        mod_time = os.path.getmtime(GROUPS_FILE)
+        if time.time() - mod_time < SEARCH_EVERY_HOURS * 3600:
+            with open(GROUPS_FILE, 'r', encoding='utf-8') as f:
+                groups = json.load(f)
+            print(f"Загружено {len(groups)} групп из кэша (обновлено менее {SEARCH_EVERY_HOURS} ч.)")
+            return groups
     vk = vk_session.get_api()
     found_ids = set()
     for kw in SEARCH_KEYWORDS:
         try:
             response = vk.groups.search(q=kw, type='group', count=200, sort=0)
             for item in response['items']:
-                group_id = -item['id']
-                found_ids.add(group_id)
+                found_ids.add(-item['id'])
             print(f"По запросу '{kw}' найдено {len(response['items'])} групп")
             time.sleep(0.5)
         except Exception as e:
@@ -164,14 +170,14 @@ def find_groups(vk_session):
     groups = list(found_ids)
     with open(GROUPS_FILE, 'w', encoding='utf-8') as f:
         json.dump(groups, f, indent=2)
-    print(f"Всего уникальных групп найдено: {len(groups)}")
+    print(f"Всего уникальных групп: {len(groups)}")
     return groups
 
-# ========== ПОТОК 1: КОММЕНТИРОВАНИЕ ПОСТОВ ==========
 def comment_posts_worker(vk_session, publics, stop_event):
     vk = vk_session.get_api()
     posted = load_json(POSTS_LOG)
     while not stop_event.is_set():
+        any_success = False
         for pub in publics:
             if stop_event.is_set():
                 break
@@ -190,6 +196,7 @@ def comment_posts_worker(vk_session, publics, stop_event):
                             posted[key] = datetime.now().isoformat()
                             save_json(POSTS_LOG, posted)
                             log_action(pub, 'comment_on_post', str(post_id), 'success')
+                            any_success = True
                             delay = random.uniform(MIN_COMMENT_DELAY, MAX_COMMENT_DELAY)
                             print(f"Пауза {delay:.0f} сек")
                             time.sleep(delay)
@@ -197,17 +204,18 @@ def comment_posts_worker(vk_session, publics, stop_event):
                 time.sleep(15)
             except Exception as e:
                 if 'Access denied' in str(e) or 'group is blocked' in str(e):
-                    print(f"Группа {pub} недоступна – пропуск")
+                    print(f"Группа {pub} недоступна – пропуск без паузы")
                 else:
                     print(f"Ошибка: {e}")
                     time.sleep(30)
-        time.sleep(60)
+        if not any_success:
+            time.sleep(60)
 
-# ========== ПОТОК 2: ОТВЕТЫ НА КОММЕНТАРИИ ==========
 def reply_comments_worker(vk_session, publics, my_id, stop_event):
     vk = vk_session.get_api()
     replied = load_json(REPLIES_LOG)
     while not stop_event.is_set():
+        any_success = False
         for pub in publics:
             if stop_event.is_set():
                 break
@@ -232,20 +240,21 @@ def reply_comments_worker(vk_session, publics, my_id, stop_event):
                                 replied[key] = datetime.now().isoformat()
                                 save_json(REPLIES_LOG, replied)
                                 log_action(from_id, 'reply_to_comment', f"{pub}_{post_id}_{comment_id}", 'success')
+                                any_success = True
                                 delay = random.uniform(MIN_REPLY_DELAY, MAX_REPLY_DELAY)
                                 print(f"Пауза {delay:.0f} сек")
                                 time.sleep(delay)
                                 break
                 time.sleep(15)
             except Exception as e:
-                if 'Access denied' in str(e):
-                    print(f"Группа {pub} недоступна")
+                if 'Access denied' in str(e) or 'group is blocked' in str(e):
+                    print(f"Группа {pub} недоступна – пропуск")
                 else:
                     print(f"Ошибка: {e}")
                     time.sleep(30)
-        time.sleep(60)
+        if not any_success:
+            time.sleep(60)
 
-# ========== ПОТОК 3: ОБРАБОТКА ЛС ==========
 def listen_messages(vk_session, my_id, stop_event):
     second_sent = load_json(SECOND_SENT_LOG)
     longpoll = VkLongPoll(vk_session)
@@ -286,27 +295,28 @@ def listen_messages(vk_session, my_id, stop_event):
     except Exception as e:
         print(f"Ошибка ЛС: {e}")
 
-# ========== FLASK ДЛЯ RENDER ==========
+# ========== FLASK-СЕРВЕР ДЛЯ RENDER ==========
 app = Flask(__name__)
 
 @app.route('/')
-def index():
+def health():
     return "VK Bot is running"
 
-# ========== ЗАПУСК БОТА В ОТДЕЛЬНОМ ПОТОКЕ ==========
 def run_bot():
     vk_session = vk_api.VkApi(token=ACCESS_TOKEN)
     try:
         my_id = str(vk_session.get_api().users.get()[0]['id'])
         print(f"ID вашего аккаунта: {my_id}")
-    except Exception as e:
-        print(f"Ошибка получения ID: {e}")
+    except:
+        print("Не удалось получить свой ID")
         return
+
     init_report()
     publics = find_groups(vk_session)
     if not publics:
-        print("Не найдено групп")
+        print("Не найдено ни одной группы. Проверьте ключевые слова или токен.")
         return
+
     stop_event = threading.Event()
     threads = [
         threading.Thread(target=comment_posts_worker, args=(vk_session, publics, stop_event), daemon=True),
@@ -315,20 +325,22 @@ def run_bot():
     ]
     for t in threads:
         t.start()
-    print(f"Бот запущен. Обрабатывается {len(publics)} групп.")
+
+    print(f"Бот запущен. Обрабатывается {len(publics)} групп (автоматически найдены).")
     try:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("Остановка бота...")
+        print("\nОстановка бота...")
         stop_event.set()
         for t in threads:
             t.join(timeout=2)
+        print("Бот остановлен.")
 
-if __name__ == "__main__":
-    # Запускаем бота в фоновом потоке
+if __name__ == '__main__':
+    # Запускаем бота в отдельном потоке
     bot_thread = threading.Thread(target=run_bot, daemon=True)
     bot_thread.start()
-    # Запускаем Flask (для Render)
-    port = int(os.environ.get("PORT", 5000))
+    # Запускаем Flask для Render
+    port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
